@@ -1,0 +1,99 @@
+# This pipeline runs the autopkg_tools.py script and adds the packages to Munki
+
+schedules:
+  - cron: 00 7 * * 1-5
+    branches:
+      include:
+      - main
+
+pool:
+  vmImage: macos-latest
+
+variables:
+  OVERRIDESEXISTS: False
+  AUTOPKG_REPO_NAME: ""
+  MUNKI_DEVOPS_PROJECT: ""
+  MUNKI_DEVOPS_REPO_NAME: ""
+  MUNKI_REPO: $(Build.SourcesDirectory)/$(MUNKI_DEVOPS_REPO_NAME)/AzureBlob
+  OVERRIDES_DIR: $(Build.SourcesDirectory)/$(AUTOPKG_REPO_NAME)/overrides
+  REPO_DIR: $(Build.SourcesDirectory)/$(AUTOPKG_REPO_NAME)
+  DEVOPS_ORGNAME: ""
+
+steps:
+
+- checkout: self
+  persistCredentials: true
+
+- script: |    
+    if [ -d $(OVERRIDES_DIR) ]; then
+    echo "##vso[task.setVariable variable=OVERRIDESEXISTS]true"
+    fi
+  displayName: Check overrides is not empty
+
+- task: PythonScript@0
+  displayName: Add recipes to recipe_list.json
+  condition: eq(variables.OVERRIDESEXISTS, true)
+  inputs:
+    scriptSource: inline
+    script: |
+     import os
+     import json
+     listOfOverrides = os.listdir("$(OVERRIDES_DIR)")
+     recipe_list = []
+     for file in listOfOverrides:
+        recipe_list.append(file)
+     with open("$(REPO_DIR)/recipe_list.json",'w') as jsonFile:
+        json.dump(recipe_list, jsonFile)
+
+- script: pip3 install -r $(REPO_DIR)/requirements.txt
+  displayName: Install py requirements
+  condition: eq(variables.OVERRIDESEXISTS, true)
+
+- script: |
+      curl -L https://github.com/munki/munki/releases/download/v5.5.1/munkitools-5.5.1.4365.pkg --output /tmp/munkitools.pkg
+      sudo installer -pkg /tmp/munkitools.pkg -target /
+  displayName: Install Munki tools
+  condition: eq(variables.OVERRIDESEXISTS, true)
+
+- script: |
+      curl -L https://github.com/autopkg/autopkg/releases/download/v2.3.1/autopkg-2.3.1.pkg --output /tmp/autopkg.pkg
+      sudo installer -pkg /tmp/autopkg.pkg -target /
+  displayName: Install AutoPkg
+  condition: eq(variables.OVERRIDESEXISTS, true)
+
+- checkout: git://$(MUNKI_DEVOPS_PROJECT)/$(MUNKI_DEVOPS_REPO_NAME)
+  lfs: true
+  persistCredentials: true
+  fetchDepth: 1
+  condition: eq(variables.OVERRIDESEXISTS, true)
+
+- script: |
+      defaults write com.github.autopkg RECIPE_OVERRIDE_DIRS $(OVERRIDES_DIR)
+      defaults write com.github.autopkg FAIL_RECIPES_WITHOUT_TRUST_INFO -bool YES
+      defaults write com.github.autopkg MUNKI_REPO $(MUNKI_REPO)
+      git config --global user.name "autopkgpipeline"
+      git config --global user.email "autopkgpipeline@azuredevops.local"
+  displayName: Set AutoPkg and Git configs
+  condition: eq(variables.OVERRIDESEXISTS, true)
+
+- script: for repo in $(cat $(REPO_DIR)/repo_list.txt); do autopkg repo-add "$repo" && autopkg repo-update "$repo"; done
+  displayName: Add recipe repos
+  condition: eq(variables.OVERRIDESEXISTS, true)
+
+- script: /usr/local/munki/makecatalogs $(MUNKI_REPO)
+  displayName: Run Munki makecatalogs
+  condition: eq(variables.OVERRIDESEXISTS, true)
+
+- script: python3 $(REPO_DIR)/autopkg_tools.py -l $(REPO_DIR)/recipe_list.json
+  displayName: Run AutoPkg
+  condition: eq(variables.OVERRIDESEXISTS, true)
+  env:
+    TEAMS_WEBHOOK: $(TEAMS_WEBHOOK)
+
+- script: |
+    cd $(REPO_DIR)
+    git add recipe_list.json
+    git commit -m "Updated recipe list"
+    git push origin HEAD:main
+  displayName: Update recipe_list.json in repo
+  condition: eq(variables.OVERRIDESEXISTS, true)
